@@ -41,9 +41,9 @@ def update_run_time():
 
 def check_ip(ip, port):
     try:
-        url = f"http://{ip}:{port}/status"
+        url = f"http://{ip}:{port}/stat"
         response = requests.get(url, timeout=1)  # 设置超时为1秒
-        if response.status_code == 200 and 'udpxy status' in response.text:
+        if response.status_code == 200 and 'Multi stream daemon' in response.text:
             print(f"扫描到有效ip: {ip}:{port}")
             return f"{ip}:{port}"
     except requests.RequestException:
