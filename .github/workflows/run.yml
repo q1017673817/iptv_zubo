@@ -1,22 +1,27 @@
-# .github/workflows/run.yml
-name: IPTV Updater
+# .github/workflows/iptv_updater.yml
+name: IPTV List Updater
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时运行一次
-  workflow_dispatch:
+    - cron: '0 */6 * * *'  # 每6小时运行一次（UTC时间）
+  workflow_dispatch:       # 允许手动触发
+
+env:
+  OUTPUT_DIR: output
+  CONFIG_DIR: zubo
 
 jobs:
-  iptv-scan:
+  update-lists:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     permissions:
-      contents: write
-      actions: write
+      contents: write  # 必须的提交权限
 
     steps:
-    - name: Checkout repository
+    - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false  # 使用GITHUB_TOKEN验证
 
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
@@ -28,29 +33,48 @@ jobs:
         python -m pip install --upgrade pip
         pip install aiohttp ratelimit
 
-    - name: Create config structure
+    - name: Initialize directories
       run: |
-        mkdir -p zubo output
-        # 创建示例配置文件
-        echo "湖南卫视,udp://225.1.1.1:5000" > zubo/湖南_电信.txt
-        echo "192.168.1.0:8000,1" > config.txt
+        mkdir -p ${{ env.OUTPUT_DIR }} ${{ env.CONFIG_DIR }}
+        # 安全创建示例文件（仅当不存在时）
+        [ -f config.txt ] || echo "192.168.1.0:8000,1" > config.txt
+        [ -f ${{ env.CONFIG_DIR }}/湖南_电信.txt ] || \
+          echo "湖南卫视,udp://225.1.1.1:5000" > ${{ env.CONFIG_DIR }}/湖南_电信.txt
 
     - name: Run IPTV Scanner
-      run: python hndxzb.py
+      run: python main.py
+      env:
+        PYTHONUNBUFFERED: 1  # 实时输出日志
 
-    - name: Upload results
+    - name: Commit updated lists
+      run: |
+        # 配置Git身份
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+        # 仅添加目标文件
+        git add ${{ env.OUTPUT_DIR }}/iptv_list.txt
+
+        # 生成带时区的提交信息
+        COMMIT_TIME=$(date +"%Y-%m-%d %H:%M:%S (UTC)")
+        COMMIT_MSG="🔄 Auto-update IPTV lists - $COMMIT_TIME"
+
+        # 条件提交
+        if git diff --cached --quiet; then
+          echo "🟢 No changes to commit"
+        else
+          git commit -m "$COMMIT_MSG"
+          git push origin HEAD:main
+          echo "✅ Successfully pushed updates"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload artifact
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: iptv-lists
         path: |
-          output/iptv_list.txt
-          output/valid_ips.txt
+          ${{ env.OUTPUT_DIR }}/*.txt
         retention-days: 3
-
-    - name: Commit results
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git add output/
-        git commit -m "Auto-update IPTV lists - $(date +'%Y%m%d_%H%M%S')"
-        git push
