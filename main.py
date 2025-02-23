@@ -1,214 +1,299 @@
-# main.py
 import os
 import re
 import time
-import aiohttp
-import asyncio
-from datetime import datetime, timedelta
-from ratelimit import limits, sleep_and_retry
-import logging
+import glob
+import requests
+import threading
+from queue import Queue
+from threading import Thread
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('iptv_scanner.log'),
-        logging.StreamHandler()
-    ]
-)
 
-# 常量配置
-CONFIG_PATH = 'config.txt'
-OUTPUT_DIR = 'output'
-SAFE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept-Language': 'en-US,en;q=0.9'
-}
-MAX_WORKERS = 50  # 异步并发数
-TEST_DURATION = 5  # 测速时长(秒)
-
-class ConfigManager:
-    @staticmethod
-    def should_run():
-        """检查是否达到执行间隔"""
-        if not os.path.exists('update_time.txt'):
-            return True
-        with open('update_time.txt', 'r') as f:
-            last_run = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
-        return datetime.now() - last_run >= timedelta(hours=6)
-
-    @staticmethod
-    def update_timestamp():
-        with open('update_time.txt', 'w') as f:
-            f.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-
-class IPScanner:
-    def __init__(self):
-        self.valid_ips = set()
+def should_run():
+    time_file = 'update_time.txt'
+    if not os.path.exists(time_file):
+        return True
     
-    @sleep_and_retry
-    @limits(calls=100, period=60)
-    async def check_ip(self, session, ip, port):
-        """异步检查单个IP有效性"""
-        try:
-            url = f"http://{ip}:{port}/stat"
-            async with session.get(url, headers=SAFE_HEADERS, timeout=3) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    if 'msd' in response.headers.get('Server', '').lower():
-                        return f"{ip}:{port}"
-        except Exception as e:
-            logging.debug(f"IP检查失败 {ip}:{port} - {str(e)}")
+    with open(time_file, 'r') as f:
+        last_time = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
+    return (datetime.now() - last_time).days >= 0
+
+
+def update_run_time():
+    with open('update_time.txt', 'w') as f:
+        f.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+
+def check_ip(ip, port):
+    try:
+        url = f"http://{ip}:{port}/stat"
+        resp = requests.get(url, timeout=2)
+        if resp.status_code == 200 and 'Multi stream daemon' in resp.text:
+            print(f"[有效IP] {ip}:{port}")
+            return f"{ip}:{port}"
+    except Exception:
         return None
 
-    async def scan_range(self, ip_base, port, scan_type):
-        """扫描指定IP段"""
-        base_parts = list(map(int, ip_base.split('.')))
-        tasks = []
-        
-        async with aiohttp.ClientSession() as session:
-            # 生成扫描IP列表
-            if scan_type == 0:
-                ips = [f"{'.'.join(map(str, base_parts[:3]))}.{d}" for d in range(1,256)]
-            else:
-                ips = [f"{'.'.join(map(str, base_parts[:2]))}.{c}.{d}" 
-                      for c in range(256) for d in range(1,256)]
-            
-            # 创建异步任务
-            for ip in ips:
-                tasks.append(self.check_ip(session, ip, port))
-            
-            # 分批处理结果
-            for i in range(0, len(tasks), MAX_WORKERS):
-                batch = tasks[i:i+MAX_WORKERS]
-                results = await asyncio.gather(*batch)
-                for result in results:
-                    if result:
-                        self.valid_ips.add(result)
-                        logging.info(f"发现有效IP: {result}")
 
-class SpeedTester:
-    async def test_speed(self, session, name, url):
-        """异步测速"""
-        try:
-            start = time.time()
-            async with session.get(url, headers=SAFE_HEADERS, timeout=TEST_DURATION+2) as response:
-                response.raise_for_status()
-                downloaded = 0
-                async for chunk in response.content.iter_chunked(1024):
-                    downloaded += len(chunk)
-                    if time.time() - start > TEST_DURATION:
-                        break
-                duration = time.time() - start
-                return (name, url, downloaded/duration/1024/1024)  # MB/s
-        except Exception as e:
-            logging.debug(f"测速失败 {url} - {str(e)}")
-            return (name, url, 0)
+def generate_ips(ip_part, scan_type):
+    a, b, c, d = map(int, ip_part.split('.'))
+    if scan_type == 0:  # D段扫描
+        return [f"{a}.{b}.{c}.{x}" for x in range(1, 256)]
+    else:  # C+D段扫描
+        return [f"{a}.{b}.{x}.{y}" for x in range(256) for y in range(256)]
 
-class ChannelProcessor:
-    @staticmethod
-    def categorize_channels(channels):
-        """分类处理频道"""
-        categories = {
-            '央视频道,#genre#': [],
-            '卫视频道,#genre#': [],
-            '湖南频道,#genre#': [],
-            '其他频道,#genre#': []
-        }
-        
-        for name, url, speed in channels:
-            name_lower = name.lower()
-            if 'cctv' in name_lower or '央视' in name:
-                key = '央视频道,#genre#'
-            elif '卫视' in name or '凤凰' in name:
-                key = '卫视频道,#genre#'
-            elif re.search(r'(湖南|长沙|株洲|湘潭|衡阳)', name):
-                key = '湖南频道,#genre#'
-            else:
-                key = '其他频道,#genre#'
-            
-            categories[key].append((name, url, speed))
-        
-        # 排序和过滤
-        for cat in categories.values():
-            cat.sort(key=lambda x: (-x[2], x[0]))  # 按速度降序，名称升序
-            # 去重逻辑
-            seen = set()
-            filtered = []
-            for item in cat:
-                if item[0] not in seen:
-                    seen.add(item[0])
-                    filtered.append(item)
-                if len(filtered) >= 15:  # 每类最多保留15个
-                    break
-            cat[:] = filtered
-        
-        return categories
 
-async def main():
-    if not ConfigManager.should_run():
-        logging.info("未达到执行间隔，跳过本次运行")
-        return
-
-    # 阶段1：IP扫描
-    scanner = IPScanner()
+def read_config(config_path):
     configs = []
     try:
-        with open(CONFIG_PATH) as f:
-            for line in f:
-                ip_port, scan_type = line.strip().rsplit(',', 1)
-                ip, port = ip_port.split(':')
-                configs.append((ip, int(port), int(scan_type)))
+        with open(config_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(',')
+                if len(parts) != 2:
+                    print(f"格式错误 行{line_num}: 需要'IP:端口,扫描类型'格式 -> {line}")
+                    continue
+                configs.append(parts)
+        return configs
     except Exception as e:
-        logging.error(f"配置文件错误: {str(e)}")
+        print(f"配置文件错误: {e}")
+        return []
+
+
+def scan_ips(ip_part, port, scan_type):
+    print(f"\n开始扫描 {ip_part} 端口 {port} 类型 {scan_type}")
+    valid_ips = []
+    ips = generate_ips(ip_part, scan_type)
+    total = len(ips)
+    checked = [0]
+    
+    def show_progress():
+        while checked[0] < total:
+            print(f"进度: {checked[0]}/{total} 有效: {len(valid_ips)}")
+            time.sleep(10)
+    
+    Thread(target=show_progress, daemon=True).start()
+    
+    with ThreadPoolExecutor(max_workers=200 if scan_type==0 else 100) as executor:
+        futures = {executor.submit(check_ip, ip, port): ip for ip in ips}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                valid_ips.append(result)
+            checked[0] += 1
+    
+    print(f"扫描完成，有效IP数量: {len(valid_ips)}\n")
+    return valid_ips
+
+
+def process_province(config_path):
+    filename = os.path.basename(config_path)
+    if not filename.endswith("_config.txt"):
         return
-
-    for ip_base, port, scan_type in configs:
-        logging.info(f"开始扫描 {ip_base}:{port} 类型{scan_type}")
-        await scanner.scan_range(ip_base, port, scan_type)
     
-    # 保存有效IP
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(f'{OUTPUT_DIR}/valid_ips.txt', 'w') as f:
-        f.write('\n'.join(scanner.valid_ips))
+    province, operator = filename.split('_')[:2]
+    print(f"\n{'='*30}\n处理: {province} {operator}\n{'='*30}")
+    
+    # 扫描IP
+    configs = read_config(config_path)
+    all_ips = []
+    for entry in configs:
+        try:
+            ip_port, scan_type = entry
+            ip_part, port = ip_port.split(':', 1)
+            all_ips.extend(scan_ips(ip_part, port, int(scan_type)))
+        except Exception as e:
+            print(f"配置错误: {entry} -> {e}")
+    
+    # 生成组播
+    tmpl_file = os.path.join('zubo', f"{province}_{operator}.txt")
+    if not os.path.exists(tmpl_file):
+        print(f"缺少模板文件: {tmpl_file}")
+        return
+    
+    with open(tmpl_file, 'r', encoding='utf-8') as f:
+        channels = [line.strip() for line in f if line.strip()]
+    
+    output = []
+    for ip in all_ips:
+        output.extend([c.replace("udp://", f"http://{ip}/udp/") for c in channels])
+    
+    with open(f"{province}_{operator}_组播.txt", 'w', encoding='utf-8') as f:
+        f.write('\n'.join(output))
 
-    # 阶段2：频道测速
-    tester = SpeedTester()
-    speed_results = []
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        # 读取原始频道列表
-        with open('zubo/湖南_电信.txt') as f:
+
+def speed_test():
+    speed_queue = Queue()
+    results = []
+    
+    # 加载所有组播频道
+    for file in glob.glob("*_组播.txt"):
+        with open(file, 'r', encoding='utf-8') as f:
             for line in f:
-                if line.strip():
-                    name, url = line.strip().split(',', 1)
-                    for ip in scanner.valid_ips:
-                        new_url = url.replace("udp://", f"http://{ip}/udp/")
-                        tasks.append(tester.test_speed(session, name, new_url))
-        
-        # 分批处理测速任务
-        for i in range(0, len(tasks), MAX_WORKERS):
-            batch = tasks[i:i+MAX_WORKERS]
-            results = await asyncio.gather(*batch)
-            speed_results.extend(results)
-            logging.info(f"完成测速批次 {i//MAX_WORKERS+1}/{(len(tasks)+MAX_WORKERS-1)//MAX_WORKERS}")
+                line = line.strip()
+                if line and ',' in line:
+                    name, url = line.split(',', 1)
+                    speed_queue.put((name, url))
+    
+    # 测速线程
+    def worker():
+        while True:
+            try:
+                name, url = speed_queue.get(timeout=10)
+                start = time.time()
+                size = 0
+                try:
+                    with requests.get(url, stream=True, timeout=5) as r:
+                        for chunk in r.iter_content(1024):
+                            size += len(chunk)
+                            if time.time() - start > 5:
+                                break
+                    speed = size / (time.time() - start) / 1024 / 1024
+                except:
+                    speed = 0
+                
+                if speed > 0.1:
+                    results.append((speed, name, url))
+                print(f"[测速] {'✓' if speed>0.1 else '✗'} {name[:20]:<20} {speed:.2f}MB/s")
+                speed_queue.task_done()
+            except:
+                break
+    
+    print("\n开始测速...")
+    threads = [Thread(target=worker) for _ in range(20)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    
+    # 排序保存
+    results.sort(reverse=True, key=lambda x: x[0])
+    with open("speed.txt", "w", encoding='utf-8') as f:
+        f.write('\n'.join([f"{name},{url},{speed:.2f}" for speed, name, url in results]))
 
-    # 阶段3：频道处理
-    processor = ChannelProcessor()
-    categorized = processor.categorize_channels([r for r in speed_results if r[2] > 0.1])
+
+def classify_channel(name):
+    """智能分类频道"""
+    name = name.lower()
+    if 'cctv' in name or '央视' in name or '中央' in name:
+        return "央视频道,#genre#"
+    elif '卫视' in name or '凤凰' in name or '翡翠' in name or '星空' in name:
+        return "卫视频道,#genre#"
+    elif re.search(r'(湖南|长沙|株洲|湘潭|衡阳|岳阳|常德|张家界|郴州|永州)', name):
+        return "湖南频道,#genre#"
+    else:
+        return "其他频道,#genre#"
+
+
+def natural_sort_key(s):
+    """自然排序算法"""
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
+
+
+def merge_files():
+    # ================= 第一部分：处理分类内容 =================
+    category_map = {
+        "央视频道,#genre#": [],
+        "卫视频道,#genre#": [],
+        "湖南频道,#genre#": [],
+        "其他频道,#genre#": []
+    }
+
+    # 处理测速文件
+    if os.path.exists("speed.txt"):
+        with open("speed.txt", 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.count(',') >= 2:
+                    name, url, _ = line.split(',', 2)
+                    category = classify_channel(name)
+                    category_map[category].append(f"{name},{url}")
+
+    # 处理组播文件
+    for file in glob.glob("*_组播.txt"):
+        if os.path.exists(file):
+            with open(file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and ',' in line:
+                        name, url = line.split(',', 1)
+                        category = classify_channel(name)
+                        category_map[category].append(f"{name},{url}")
+
+    # 生成分类内容
+    final_content = []
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    final_content.append(f"更新时间,#genre#\n{current_time},url\n")
     
-    # 生成最终文件
-    with open(f'{OUTPUT_DIR}/iptv_list.txt', 'w') as f:
-        f.write(f"更新时间,#genre#\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},url\n\n")
-        for category, channels in categorized.items():
-            f.write(f"{category}:\n")
-            for name, url, speed in channels:
-                f.write(f"{name},{url}\n")
-            f.write("\n")
+    # 分类区块处理
+    for category in ["央视频道,#genre#", "卫视频道,#genre#", "湖南频道,#genre#", "其他频道,#genre#"]:
+        channels = category_map[category]
+        
+        # 去重逻辑
+        unique_channels = {}
+        for chan in channels:
+            name, url = chan.split(',', 1)
+            if name not in unique_channels:
+                unique_channels[name] = []
+            if len(unique_channels[name]) < 10:
+                unique_channels[name].append(url)
+        
+        # 排序处理
+        sorted_channels = []
+        for name in sorted(unique_channels.keys(), key=natural_sort_key):
+            for url in unique_channels[name][:10]:
+                sorted_channels.append(f"{name},{url}")
+        
+        # 添加分类头
+        if sorted_channels:
+            final_content.append(f"{category}\n" + "\n".join(sorted_channels))
+
+    # ================= 第二部分：追加特殊文件 =================
+    special_files = ["AKTV.txt", "hnyd.txt"]
+    for file in special_files:
+        if os.path.exists(file):
+            with open(file, 'r', encoding='utf-8') as f:
+                # 保持原文件完整结构
+                content = []
+                current_category = ""
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.endswith("#genre#"):
+                        current_category = line
+                        content.append(f"\n{current_category}")
+                    else:
+                        content.append(line)
+                
+                if content:
+                    final_content.append("\n".join(content))
+                    print(f"已追加文件: {file} (共{len(content)}行)")
+
+    # ================= 写入最终文件 =================
+    with open("iptv_list.txt", "w", encoding='utf-8') as f:
+        f.write("\n\n".join(final_content))
+
+
+def main():
+    if not should_run():
+        print("未达到执行时间间隔")
+        return
     
-    ConfigManager.update_timestamp()
-    logging.info("任务执行完成")
+    update_run_time()
+    
+    # 处理所有省份配置
+    for conf in glob.glob(os.path.join('zubo', '*_config.txt')):
+        process_province(conf)
+    
+    # 测速和合并
+    speed_test()
+    merge_files()
+    
+    print("\n任务完成! 最终列表已保存至 iptv_list.txt")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
