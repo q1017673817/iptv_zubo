@@ -4,6 +4,7 @@ from ipaddress import ip_network
 import socket
 import threading
 import queue
+import time
 
 class PortScannerGUI:
     def __init__(self):
@@ -11,15 +12,15 @@ class PortScannerGUI:
         self.root.title("端口扫描工具")
         self.root.resizable(False, False)
         
-        # 创建线程安全队列
+        # 初始化变量
         self.output_queue = queue.Queue()
+        self.progress_queue = queue.Queue()
         self.scanning = False
+        self.total_tasks = 0
+        self.completed_tasks = 0
         
-        # 初始化界面
         self.create_widgets()
-        
-        # 启动队列检查
-        self.process_queue()
+        self.process_queues()
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding=10)
@@ -40,34 +41,36 @@ class PortScannerGUI:
 
         ttk.Label(main_frame, text="线程数:").grid(row=3, column=0, sticky=tk.W, pady=2)
         self.threads_entry = ttk.Entry(main_frame, width=10)
-        self.threads_entry.insert(0, "50")  # 默认线程数
+        self.threads_entry.insert(0, "50")
         self.threads_entry.grid(row=3, column=1, sticky=tk.W, pady=2, padx=5)
 
         # 按钮区域
         btn_frame = ttk.Frame(main_frame)
         btn_frame.grid(row=4, columnspan=2, pady=10)
-        
         self.start_btn = ttk.Button(btn_frame, text="开始扫描", command=self.start_scan)
         self.start_btn.pack(side=tk.LEFT, padx=5)
-        
         ttk.Button(btn_frame, text="退出", command=self.root.quit).pack(side=tk.LEFT, padx=5)
+
+        # 进度条区域
+        ttk.Label(main_frame, text="扫描进度:").grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.progress_bar = ttk.Progressbar(main_frame, orient=tk.HORIZONTAL, length=300, mode='determinate')
+        self.progress_bar.grid(row=5, column=1, pady=5, sticky=tk.W)
+        self.progress_label = ttk.Label(main_frame, text="准备就绪")
+        self.progress_label.grid(row=6, columnspan=2, pady=2)
 
         # 输出区域
         output_frame = ttk.Frame(main_frame)
-        output_frame.grid(row=5, columnspan=2)
-        
+        output_frame.grid(row=7, columnspan=2)
         self.output_area = scrolledtext.ScrolledText(output_frame, width=60, height=20, wrap=tk.WORD)
         self.output_area.pack()
         self.output_area.configure(state='disabled')
 
     def validate_inputs(self):
         try:
-            # 验证IP格式
             ip_str = self.ip_entry.get().strip()
             if not ip_str:
                 raise ValueError("IP范围不能为空")
                 
-            # 验证端口范围
             start_port = int(self.start_port_entry.get())
             end_port = int(self.end_port_entry.get())
             if not (0 < start_port <= 65535) or not (0 < end_port <= 65535):
@@ -75,7 +78,6 @@ class PortScannerGUI:
             if start_port > end_port:
                 raise ValueError("起始端口不能大于结束端口")
                 
-            # 验证线程数
             threads = int(self.threads_entry.get())
             if threads <= 0:
                 raise ValueError("线程数必须大于0")
@@ -85,6 +87,14 @@ class PortScannerGUI:
         except ValueError as e:
             messagebox.showerror("输入错误", str(e))
             return None
+
+    def calculate_total_tasks(self, network, start_port, end_port):
+        try:
+            ip_count = sum(1 for _ in network.hosts())
+            port_count = end_port - start_port + 1
+            return ip_count * port_count
+        except:
+            return 0
 
     def start_scan(self):
         if self.scanning:
@@ -98,15 +108,24 @@ class PortScannerGUI:
         
         try:
             network = ip_network(ip_str, strict=False)
-        except ValueError:
-            messagebox.showerror("错误", "无效的IP地址或CIDR格式")
+            self.total_tasks = self.calculate_total_tasks(network, start_port, end_port)
+            if self.total_tasks == 0:
+                raise ValueError("无效的扫描范围")
+                
+            self.completed_tasks = 0
+            self.progress_bar['value'] = 0
+            self.progress_label.config(text="0/0 (0.00%)")
+            self.output_area.configure(state='normal')
+            self.output_area.delete(1.0, tk.END)
+            self.output_area.configure(state='disabled')
+            
+        except ValueError as e:
+            messagebox.showerror("错误", str(e))
             return
             
-        # 禁用开始按钮
         self.start_btn.config(state=tk.DISABLED)
         self.scanning = True
         
-        # 启动扫描线程
         scan_thread = threading.Thread(
             target=self.run_scan,
             args=(network, start_port, end_port, num_threads),
@@ -116,12 +135,14 @@ class PortScannerGUI:
 
     def run_scan(self, network, start_port, end_port, num_threads):
         try:
-            # 创建线程池
             threads = []
             for ip in network.hosts():
                 if not self.scanning:
                     break
                     
+                port_count = end_port - start_port + 1
+                self.progress_queue.put(port_count)  # 预增进度
+                
                 t = threading.Thread(
                     target=self.scan_ip,
                     args=(str(ip), start_port, end_port),
@@ -130,19 +151,17 @@ class PortScannerGUI:
                 t.start()
                 threads.append(t)
                 
-                # 控制线程数量
                 while len(threads) >= num_threads:
                     t = threads.pop(0)
                     t.join(timeout=0.1)
                     
-            # 等待剩余线程
             for t in threads:
                 t.join()
                 
         except Exception as e:
             self.output_queue.put(f"扫描错误: {str(e)}")
         finally:
-            self.output_queue.put("扫描完成")
+            self.progress_queue.put(None)
             self.scanning = False
             self.root.after(100, lambda: self.start_btn.config(state=tk.NORMAL))
 
@@ -160,12 +179,31 @@ class PortScannerGUI:
                 sock.close()
             except Exception:
                 pass
+            finally:
+                self.progress_queue.put(1)
 
-    def process_queue(self):
+    def process_queues(self):
+        # 处理输出队列
         while not self.output_queue.empty():
             msg = self.output_queue.get_nowait()
             self.update_output(msg)
-        self.root.after(100, self.process_queue)
+            
+        # 处理进度队列
+        while not self.progress_queue.empty():
+            increment = self.progress_queue.get_nowait()
+            if increment is None:
+                self.progress_label.config(text="扫描完成！")
+                break
+                
+            self.completed_tasks += increment
+            if self.total_tasks > 0:
+                progress = self.completed_tasks / self.total_tasks * 100
+                self.progress_bar['value'] = progress
+                self.progress_label.config(
+                    text=f"{self.completed_tasks}/{self.total_tasks} ({progress:.2f}%)"
+                )
+
+        self.root.after(200, self.process_queues)
 
     def update_output(self, text):
         self.output_area.configure(state='normal')
