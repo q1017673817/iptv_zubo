@@ -27,5 +27,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: port-scanner-exe
+          name: port-scanner
           path: dist/port_scanner_with_gui.exe
