@@ -9,7 +9,7 @@ import time
 class PortScannerGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("端口扫描工具")
+        self.root.title("端口扫描工具 by luoye")
         self.root.resizable(False, False)
         
         # 初始化变量
@@ -41,7 +41,7 @@ class PortScannerGUI:
 
         ttk.Label(main_frame, text="线程数:").grid(row=3, column=0, sticky=tk.W, pady=2)
         self.threads_entry = ttk.Entry(main_frame, width=10)
-        self.threads_entry.insert(0, "50")
+        self.threads_entry.insert(0, "200")
         self.threads_entry.grid(row=3, column=1, sticky=tk.W, pady=2, padx=5)
 
         # 按钮区域
