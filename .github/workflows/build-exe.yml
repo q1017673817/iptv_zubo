@@ -14,18 +14,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"  # 确保使用 Python 3.10.x
+          python-version: "3.10"
  
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySimpleGUI==4.59.0 pyinstaller  # 使用验证有效的 4.59.0 版本
+          pip install pyinstaller
  
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --hidden-import=PySimpleGUI --collect-all PySimpleGUI port_scanner_with_gui.py
+        run: pyinstaller --onefile --windowed port_scanner_with_gui_tk.py
  
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: port-scanner-exe
-          path: dist/port_scanner_with_gui.exe
+          name: port-scanner
+          path: dist/port_scanner_with_gui_tk.exe
