@@ -21,10 +21,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySimpleGUI pyinstaller
+          pip install PySimpleGUI==4.60.5 pyinstaller  # 固定旧版本避免兼容问题
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --hidden-import=PySimpleGUI port_scanner_with_gui.py
+        run: pyinstaller --onefile --windowed --hidden-import=PySimpleGUI --collect-all PySimpleGUI port_scanner_with_gui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
