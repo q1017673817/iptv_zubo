@@ -1,0 +1,33 @@
+name: Build EXE
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySimpleGUI pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --onefile --windowed port_scanner_with_gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: port-scanner-exe
+          path: dist/port_scanner_with_gui.exe
