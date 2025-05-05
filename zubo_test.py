@@ -24,7 +24,6 @@ def read_config(config_file):
         return ip_configs
     except Exception as e:
         print(f"设置文件错误: {e}")
-        return None
 # 生成待扫描ip_port
 def generate_ip_ports(ip, port, option):
     a, b, c, d = map(int, ip.split('.'))
